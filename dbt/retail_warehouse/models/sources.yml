@@ -1,0 +1,10 @@
+version: 2
+
+sources:
+
+  - name: temp
+    schema: temp
+
+    tables:
+
+      - name: retail_batch

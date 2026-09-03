@@ -1,0 +1,53 @@
+version: 2
+
+models:
+  - name: dim_date
+    description: Date dimension, one row per calendar date present in sales.
+    columns:
+      - name: date_key
+        tests: [not_null, unique]
+      - name: full_date
+        tests: [not_null, unique]
+
+  - name: dim_product
+    description: Product dimension, one row per stock code.
+    columns:
+      - name: product_key
+        tests: [not_null, unique]
+      - name: stock_code
+        tests: [not_null, unique]
+
+  - name: dim_country
+    description: Country dimension, one row per normalized country.
+    columns:
+      - name: country_key
+        tests: [not_null, unique]
+      - name: country_name
+        tests: [not_null, unique]
+
+  - name: fact_sales
+    description: Transaction-line fact table linked to date, product, and country dimensions.
+    columns:
+      - name: sales_key
+        tests: [not_null, unique]
+      - name: date_key
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_date')
+                field: date_key
+      - name: product_key
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_product')
+                field: product_key
+      - name: country_key
+        tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_country')
+                field: country_key

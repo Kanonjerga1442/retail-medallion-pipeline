@@ -1,0 +1,262 @@
+services:
+
+  # ==========================================================
+  # POSTGRESQL
+  #
+  # Chứa:
+  # - control
+  # - temp
+  # - silver
+  # - gold
+  # - audit
+  #
+  # Đồng thời chứa database metabase_app
+  # ==========================================================
+  postgres:
+    image: postgres:17
+    container_name: retail-postgres
+
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: warehouse
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      # Persistent PostgreSQL data
+      - postgres_data:/var/lib/postgresql/data
+
+      # SQL init scripts
+      - ./sql/init:/docker-entrypoint-initdb.d
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER} -d warehouse"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+  dbt:
+    build:
+      context: ./docker/dbt
+      dockerfile: Dockerfile
+
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: warehouse
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+
+      DBT_PROFILES_DIR: /usr/app/dbt/retail_warehouse
+
+    working_dir: /usr/app/dbt/retail_warehouse
+
+    volumes:
+      - ./dbt:/usr/app/dbt
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+
+
+  # ==========================================================
+  # SPARK MASTER
+  #
+  # Dùng cho:
+  # - CSV -> TEMP Parquet
+  # - TEMP Parquet -> Bronze
+  # - Bronze -> PostgreSQL TEMP qua JDBC
+  # - Reconciliation
+  # ==========================================================
+  spark-master:
+    image: apache/spark:4.2.0-python3
+    container_name: spark-master
+    user: root
+
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: warehouse
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+
+    ports:
+      # Spark cluster
+      - "7077:7077"
+
+      # Spark Master Web UI
+      - "8081:8080"
+
+    volumes:
+      # Landing CSV / Temp Parquet / Bronze Parquet
+      - ./data:/opt/pipeline/data
+
+      # Spark jobs
+      - ./spark_jobs:/opt/pipeline/spark_jobs
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+
+  # ==========================================================
+  # SPARK WORKER
+  # ==========================================================
+  spark-worker:
+    image: apache/spark:4.2.0-python3
+    container_name: spark-worker
+    user: root
+
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: warehouse
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+      - --webui-port
+      - "8081"
+
+    ports:
+      # Spark Worker Web UI
+      - "8082:8081"
+
+    volumes:
+      - ./data:/opt/pipeline/data
+      - ./spark_jobs:/opt/pipeline/spark_jobs
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+      spark-master:
+        condition: service_started
+
+    restart: unless-stopped
+
+
+  # ==========================================================
+  # AIRFLOW
+  #
+  # Orchestrator của toàn pipeline
+  # ==========================================================
+  airflow:
+    user: "0:0"
+    build:
+      context: .
+      dockerfile: docker/airflow/Dockerfile
+
+    container_name: retail-airflow
+
+    command: airflow standalone
+
+    environment:
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      DBT_LOG_PATH: /tmp/dbt_logs
+      DBT_TARGET_PATH: /tmp/dbt_target
+      DBT_PROFILES_DIR: /opt/pipeline/dbt_retail
+      # Spark connection
+      AIRFLOW_CONN_SPARK_DEFAULT: "spark://spark-master:7077"
+
+      # PostgreSQL
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: warehouse
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+
+    ports:
+      # Airflow UI
+      - "8080:8080"
+
+    volumes:
+      # Airflow metadata/config
+      - airflow_home:/opt/airflow
+
+      # DAGs
+      - ./airflow/dags:/opt/airflow/dags
+
+      # CSV / Parquet / Bronze
+      - ./data:/opt/pipeline/data
+
+      # Spark jobs
+      - ./spark_jobs:/opt/pipeline/spark_jobs
+
+      # dbt project
+      - ./dbt/retail_warehouse:/opt/pipeline/dbt_retail
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+      spark-master:
+        condition: service_started
+
+    restart: unless-stopped
+
+
+  # ==========================================================
+  # METABASE
+  #
+  # BI / Dashboard / Visualization
+  # ==========================================================
+  metabase:
+    image: metabase/metabase:latest
+    container_name: retail-metabase
+
+    environment:
+      # Database nội bộ để Metabase lưu:
+      # - account
+      # - dashboard
+      # - questions
+      # - settings
+
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: metabase_app
+      MB_DB_PORT: "5432"
+      MB_DB_USER: ${POSTGRES_USER}
+      MB_DB_PASS: ${POSTGRES_PASSWORD}
+      MB_DB_HOST: postgres
+
+    ports:
+      # Metabase UI
+      - "3000:3000"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+
+# ==========================================================
+# PERSISTENT VOLUMES
+# ==========================================================
+volumes:
+
+  postgres_data:
+
+  airflow_home:
