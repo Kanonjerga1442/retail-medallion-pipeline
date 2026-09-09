@@ -28,7 +28,7 @@ data/gold/*
 !data/gold/.gitkeep
 data/quarantine/
 data/cdc/
-data/test_backups/
+data/validation_backups/
 
 # Local database backups and benchmark output
 *.dump

@@ -108,7 +108,7 @@ Run `full_refresh` once when initializing the project so CDC has a complete base
 
 ### Verified one-row incremental test
 
-The test run `portfolio_incremental_update_20260909` changed only the description of invoice `489434`, stock code `85048`. CDC classified it as one update and narrowed the downstream work from a 100-day batch to one date:
+An incremental validation changed only the description of invoice `489434`, stock code `85048`. CDC classified it as one update and narrowed the downstream work from a 100-day batch to one date:
 
 ```text
 CDC MANIFEST ... affected_dates=["2009-12-01"]
@@ -275,7 +275,7 @@ data/landing_csv/online_retail_II.csv
 | Metabase | BI questions and dashboarding |
 | Docker Compose | Reproducible local platform |
 | Parquet + Snappy | Columnar data-lake storage and export |
-| PowerShell | Optional local test runner and timing capture |
+| PowerShell | Optional local validation and timing utilities |
 
 ## Repository structure
 
@@ -289,7 +289,7 @@ data/landing_csv/online_retail_II.csv
 │   └── tests/                     # Reconciliation tests
 ├── docker/                        # Airflow and dbt images
 ├── metabase/queries/              # Version-controlled dashboard SQL
-├── scripts/                       # Local test/timing utilities
+├── scripts/                       # Local validation and timing utilities
 ├── spark_jobs/                    # PySpark ingestion and export jobs
 ├── sql/init/                      # PostgreSQL bootstrap DDL
 └── docker-compose.yml             # Local platform
@@ -331,7 +331,7 @@ Open Airflow, unpause `retail_medallion_pipeline`, select **Trigger DAG w/ confi
 | Metabase | http://localhost:3000 |
 | PostgreSQL | `localhost:5432` |
 
-## Portfolio talking points
+## Engineering highlights
 
 - Designed an ID-driven, dependency-ordered Medallion pipeline processing over one million retail rows.
 - Implemented automatic CDC incremental loads plus parameterized historical backfills with 100-day internal batches.
@@ -342,4 +342,4 @@ Open Airflow, unpause `retail_medallion_pipeline`, select **Trigger DAG w/ confi
 
 ## License and data attribution
 
-Project code may be used for learning and portfolio review. The source dataset remains subject to the UCI Online Retail II CC BY 4.0 license and attribution requirements.
+Project code may be used for learning and technical evaluation. The source dataset remains subject to the UCI Online Retail II CC BY 4.0 license and attribution requirements.
