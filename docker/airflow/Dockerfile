@@ -43,6 +43,7 @@ RUN pip install --no-cache-dir \
     "apache-airflow==3.3.1" \
     "apache-airflow-providers-apache-spark==6.3.1" \
     "dbt-postgres==1.11.0" \
+    "pyarrow==25.0.0" \
     "psycopg2-binary"
 
 RUN pip check

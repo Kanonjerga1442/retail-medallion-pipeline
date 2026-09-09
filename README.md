@@ -2,36 +2,38 @@
 
 An end-to-end batch analytics engineering project that transforms the UCI **Online Retail II** dataset from raw CSV into a tested Medallion data lake, a PostgreSQL star schema, Parquet exports, and a Metabase sales dashboard.
 
-The project demonstrates production-oriented data engineering patterns: date-range backfills, incremental loads, idempotent reruns, deterministic job ordering, data-quality quarantine, duplicate isolation, reconciliation, dimensional modeling, orchestration, and BI delivery.
+The project demonstrates production-oriented data engineering patterns: full refreshes, snapshot-diff CDC, date-range backfills, incremental loads, idempotent reruns, deterministic job ordering, data-quality quarantine, duplicate isolation, reconciliation, dimensional modeling, orchestration, and BI delivery.
 
 ## Project at a glance
 
 | Result | Validated value |
 |---|---:|
-| Input rows processed (2009-12-01 to 2011-12-04) | **1,049,664** |
-| Valid Silver transactions / Gold facts | **1,015,487** |
-| Duplicate rows isolated | **34,172** |
+| Input rows processed (2009-12-01 to 2011-12-09) | **1,067,371** |
+| Valid Silver transactions / Gold facts | **1,033,031** |
+| Duplicate rows isolated | **34,335** |
 | Rejected rows isolated | **5** |
-| Distinct invoices | **52,991** |
-| Distinct customers | **5,925** |
-| Products in `dim_product` | **5,303** |
+| Distinct invoices | **53,623** |
+| Distinct identified customers | **5,942** |
+| Products in `dim_product` | **5,304** |
 | Countries in `dim_country` | **43** |
-| Active sales dates in `dim_date` | **599** |
-| Gross sales | **£19,972,474.70** |
-| Adjustments | **-£1,258,381.30** |
-| Net sales | **£18,714,093.40** |
+| Active sales dates in `dim_date` | **604** |
+| Gross sales | **£20,476,260.45** |
+| Adjustments | **-£1,462,050.61** |
+| Net sales | **£19,014,209.84** |
 
 The measured range reconciles exactly:
 
 ```text
-1,015,487 valid + 34,172 duplicates + 5 rejects = 1,049,664 input rows
+1,033,031 valid + 34,335 duplicates + 5 rejects = 1,067,371 input rows
 ```
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    A[Online Retail II CSV] -->|Spark| B[Temporary Parquet]
+    A[Online Retail II CSV snapshot] -->|Read once per DAG run| S[Prepared source Parquet by date]
+    S -->|100-day snapshot comparison| X[CDC INSERT / UPDATE / DELETE]
+    X --> B[Temporary Parquet - selected partitions]
     B -->|Spark / 100-day range| C[Bronze Parquet]
     C -->|Spark JDBC| D[(PostgreSQL temp.retail_batch)]
     D -->|dbt classify & validate| E[Silver]
@@ -57,11 +59,13 @@ flowchart LR
 
 ## Pipeline flow and job ordering
 
-Airflow exposes one task, `run_pipeline`, to keep the DAG view compact. Internally, the task splits a selected backfill range into **100-calendar-day batches** and logs progress as `batch=n/total`. Every batch executes the following IDs in ascending order; a larger ID always runs later.
+Airflow exposes one task, `run_pipeline`, to keep the DAG view compact. Internally, all three modes are split into **100-calendar-day batches** and log progress as `batch=n/total`. The CSV is prepared into date-partitioned Parquet once per DAG run; each batch then reads only its own partitions. Batch jobs execute in ascending ID order; a larger ID always runs later.
 
 | Job ID | Layer/group | Output or responsibility |
 |---:|---|---|
-| 100 | Bronze | Load the selected Temp Parquet range into date-partitioned Bronze Parquet |
+| 40 | Source prepare | Read the CSV once and create date-partitioned source Parquet |
+| 50 | CDC | Compare one 100-day prepared-source range with committed state |
+| 100 | Bronze | Replace only the affected date partitions, or rebuild all Bronze in full refresh |
 | 200 | Temp | Load Bronze into `temp.retail_batch` through JDBC |
 | 300 | Silver common | Apply shared typing, standardization, quality rules, classification and row ranking |
 | 310 | Silver | Materialize `silver.retail_rejects` |
@@ -73,34 +77,80 @@ Airflow exposes one task, `run_pipeline`, to keep the DAG view compact. Internal
 | 420 | Gold dimension | Build `gold.dim_country` |
 | 500 | Gold fact | Build `gold.fact_sales` |
 | 510 | Gold QA | Run uniqueness, not-null and relationship tests |
-| 600 | Export | Export Silver and Gold tables to partitioned Parquet |
+| 550 | CDC commit | Commit the successful batch with PyArrow, without starting another Spark application |
+| 600 | Final export | Export Silver and Gold once after every batch succeeds |
 
 Representative Airflow logs:
 
 ```text
-PIPELINE START total_batches=8
+PIPELINE PLAN mode=full_refresh total_batches=8
+SOURCE PREPARE SUCCESS target=.../source_snapshot
 BATCH START batch=3/8 range=2010-06-19..2010-09-26 days=100
 JOB START batch=3/8 job_id=330 table=silver.retail_transactions
 JOB SUCCESS batch=3/8 job_id=330 elapsed_seconds=...
 BATCH SUCCESS batch=3/8 elapsed_seconds=...
+FINAL JOB SUCCESS job_id=600 table=silver_and_gold_parquet elapsed_seconds=...
 ```
 
 If a command fails, the error marker includes the batch, exact date range, job ID, table and elapsed time.
 
-## Incremental versus backfill
+## Full refresh, incremental and backfill
 
-- **Incremental** processes newly arrived data only and accepts a range of up to 100 days. Example: load yesterday's transactions without rebuilding history.
-- **Backfill** processes a historical range and automatically divides it into as many internal 100-day batches as required. The validated 734-day range produces eight internal batches while Airflow still displays a single task.
-- Silver and Gold models delete only the selected date range before appending its replacement, making a rerun idempotent without deleting history outside that range.
+- **Full refresh** takes no date range. It resets managed targets once, prepares the CSV once, rebuilds Bronze/Silver/Gold in 100-day ranges, commits each successful range and exports once at the end.
+- **Incremental** takes no date range. It prepares the current snapshot once and compares each 100-day range with committed state. Unchanged ranges skip downstream jobs and state rewrites. Within a changed batch, downstream jobs rebuild only the consecutive dates listed in the CDC manifest, so a one-day change does not rewrite the other 99 days; deleted dates are still propagated.
+- **Backfill** divides the requested historical range into 100-day windows and deliberately rebuilds every selected window, even when source values match the CDC state.
+- CDC state is committed only after downstream processing succeeds. A failed run therefore detects the same changes again on retry.
+- Silver, Gold facts and Parquet exports replace exact affected dates, including dates that became empty after deletes.
+
+Because the source is a CSV snapshot rather than a transactional database, CDC is implemented by snapshot comparison, not WAL/binlog capture. The synthetic record identity uses invoice number, stock code, invoice timestamp, customer ID and an occurrence number. Changes to non-identity fields are `UPDATE`; identity changes appear as a `DELETE` plus an `INSERT`.
+
+Run `full_refresh` once when initializing the project so CDC has a complete baseline. Starting directly with incremental is supported, but every source row is then reported as an initial `INSERT` event.
+
+### Verified one-row incremental test
+
+The test run `portfolio_incremental_update_20260909` changed only the description of invoice `489434`, stock code `85048`. CDC classified it as one update and narrowed the downstream work from a 100-day batch to one date:
+
+```text
+CDC MANIFEST ... affected_dates=["2009-12-01"]
+change_counts={"delete":0,"insert":0,"update":1}
+CHANGE WINDOW START batch=1/8 window=1/1 range=2009-12-01..2009-12-01
+CHANGE WINDOW SUCCESS batch=1/8 window=1/1 range=2009-12-01..2009-12-01
+```
+
+During this validation, an Arrow/Spark timestamp precision mismatch was found on the first retry. The CDC writer now coerces committed timestamps to microseconds, which is compatible with Spark's vectorized Parquet reader. See [`docs/incremental_cdc_validation.md`](docs/incremental_cdc_validation.md) for the reproducible commands and verification queries.
+
+CDC runtime data is stored under:
+
+```text
+data/cdc/state/retail_snapshot/       # last successfully committed snapshot
+data/cdc/active/<run-token>/          # candidate snapshot and manifest
+data/cdc/history/run_token=<token>/   # committed change events with before/after JSON
+```
 
 Manual trigger example:
 
 ```json
 {
   "mode": "backfill",
-  "start_date": "2009-12-01",
-  "end_date": "2011-12-04",
+  "backfill_start_date": "2009-12-01",
+  "backfill_end_date": "2011-12-04",
   "batch_days": 100
+}
+```
+
+Full refresh example:
+
+```json
+{
+  "mode": "full_refresh"
+}
+```
+
+Incremental CDC example:
+
+```json
+{
+  "mode": "incremental"
 }
 ```
 
@@ -195,7 +245,12 @@ The Metabase `Retail Sales Overview` dashboard includes headline sales KPIs and 
 - top countries by net sales;
 - top 10 products by returned/cancelled units.
 
-The last chart's version-controlled SQL is available at [`metabase/queries/top_10_returned_cancelled_products.sql`](metabase/queries/top_10_returned_cancelled_products.sql).
+Version-controlled Metabase SQL includes:
+
+- [`monthly_sales_trend.sql`](metabase/queries/monthly_sales_trend.sql): monthly gross, adjustment and net-sales trends;
+- [`country_sales_performance.sql`](metabase/queries/country_sales_performance.sql): country-level revenue, invoices and identified customers;
+- [`product_adjustment_rate.sql`](metabase/queries/product_adjustment_rate.sql): product return/cancellation value and adjustment rate;
+- [`top_10_returned_cancelled_products.sql`](metabase/queries/top_10_returned_cancelled_products.sql): products with the highest adjusted unit volume.
 
 ## Dataset
 
@@ -262,17 +317,9 @@ data/landing_csv/online_retail_II.csv
 docker compose up -d --build
 ```
 
-### 4. Convert the landing CSV once
+### 4. Trigger the pipeline
 
-```powershell
-docker compose exec -T airflow /opt/spark/bin/spark-submit `
-  --master spark://spark-master:7077 `
-  /opt/pipeline/spark_jobs/00_csv_to_temp_parquet.py
-```
-
-### 5. Trigger the pipeline
-
-Open Airflow, unpause `retail_medallion_pipeline`, select **Trigger DAG w/ config**, and provide an incremental or backfill date range.
+Open Airflow, unpause `retail_medallion_pipeline`, select **Trigger DAG w/ config**, and choose `full_refresh`, `incremental`, or `backfill`. The DAG reads the landing CSV directly; the old one-time conversion step is no longer required.
 
 ## Local services
 
@@ -287,7 +334,7 @@ Open Airflow, unpause `retail_medallion_pipeline`, select **Trigger DAG w/ confi
 ## Portfolio talking points
 
 - Designed an ID-driven, dependency-ordered Medallion pipeline processing over one million retail rows.
-- Implemented parameterized incremental and historical backfill workflows with 100-day internal batches.
+- Implemented automatic CDC incremental loads plus parameterized historical backfills with 100-day internal batches.
 - Built reusable Silver classification plus isolated clean, duplicate, and rejected datasets.
 - Replaced fixed daily aggregates with a reusable OLAP star schema.
 - Added count/hash reconciliation, dbt key tests, foreign-key tests and idempotent range reruns.

@@ -1,5 +1,6 @@
 ﻿import sys
-from datetime import datetime
+import os
+from datetime import datetime, timedelta
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -9,13 +10,14 @@ from pyspark.sql import functions as F
 # ARGUMENTS
 # ============================================================
 
-if len(sys.argv) != 3:
+if len(sys.argv) not in {3, 4}:
     raise ValueError(
-        "Usage: 01_temp_parquet_to_bronze.py START_DATE END_DATE"
+        "Usage: 01_temp_parquet_to_bronze.py START_DATE END_DATE [MODE]"
     )
 
 START_DATE = sys.argv[1]
 END_DATE = sys.argv[2]
+MODE = sys.argv[3] if len(sys.argv) == 4 else "backfill"
 
 start_dt = datetime.strptime(START_DATE, "%Y-%m-%d")
 end_dt = datetime.strptime(END_DATE, "%Y-%m-%d")
@@ -57,6 +59,7 @@ print("=" * 80)
 print("TEMP PARQUET -> BRONZE")
 print(f"START_DATE : {START_DATE}")
 print(f"END_DATE   : {END_DATE}")
+print(f"MODE       : {MODE}")
 print("=" * 80)
 
 
@@ -64,25 +67,24 @@ print("=" * 80)
 # READ ONLY SELECTED DATE RANGE
 # ============================================================
 
-source_df = (
-    spark.read
-    .option("basePath", TEMP_BASE)
-    .parquet(TEMP_BASE)
-    .filter(
-        (F.col("_batch_date") >= F.lit(START_DATE).cast("date"))
-        &
-        (F.col("_batch_date") <= F.lit(END_DATE).cast("date"))
+try:
+    source_df = spark.read.option("basePath", TEMP_BASE).parquet(TEMP_BASE)
+except Exception:
+    run_token = os.getenv("CDC_RUN_TOKEN")
+    if not run_token:
+        raise
+    source_df = spark.read.parquet(
+        f"/opt/pipeline/data/cdc/active/{run_token}/candidate_snapshot"
     )
+
+source_df = source_df.filter(
+    (F.col("_batch_date") >= F.lit(START_DATE).cast("date"))
+    & (F.col("_batch_date") <= F.lit(END_DATE).cast("date"))
 )
 
 source_df.cache()
 
 source_count = source_df.count()
-
-if source_count == 0:
-    raise RuntimeError(
-        f"No TEMP Parquet data between {START_DATE} and {END_DATE}"
-    )
 
 print(f"SOURCE COUNT = {source_count}")
 
@@ -121,19 +123,33 @@ bronze_df = (
 
 
 # ============================================================
-# DYNAMIC PARTITION OVERWRITE
+# REPLACE THE EXACT TARGET PARTITION(S)
 #
 # Chỉ overwrite những invoice_date nằm trong dataframe.
 # Không xóa Bronze history ngoài selected range.
 # ============================================================
 
-(
-    bronze_df.write
-    .mode("overwrite")
-    .partitionBy("invoice_date")
-    .option("compression", "snappy")
-    .parquet(BRONZE_BASE)
-)
+jvm = spark.sparkContext._gateway.jvm
+hadoop_conf = spark.sparkContext._jsc.hadoopConfiguration()
+fs = jvm.org.apache.hadoop.fs.FileSystem.get(hadoop_conf)
+
+if MODE == "full_refresh":
+    fs.delete(jvm.org.apache.hadoop.fs.Path(BRONZE_BASE), True)
+else:
+    cursor = start_dt
+    while cursor <= end_dt:
+        partition_path = f"{BRONZE_BASE}/invoice_date={cursor.strftime('%Y-%m-%d')}"
+        fs.delete(jvm.org.apache.hadoop.fs.Path(partition_path), True)
+        cursor += timedelta(days=1)
+
+if source_count > 0:
+    (
+        bronze_df.write
+        .mode("append")
+        .partitionBy("invoice_date")
+        .option("compression", "snappy")
+        .parquet(BRONZE_BASE)
+    )
 
 print("BRONZE WRITE COMPLETE")
 
@@ -142,16 +158,19 @@ print("BRONZE WRITE COMPLETE")
 # READ TARGET RANGE BACK
 # ============================================================
 
-target_df = (
-    spark.read
-    .option("basePath", BRONZE_BASE)
-    .parquet(BRONZE_BASE)
-    .filter(
-        (F.col("invoice_date") >= F.lit(START_DATE).cast("date"))
-        &
-        (F.col("invoice_date") <= F.lit(END_DATE).cast("date"))
-    )
-)
+if fs.exists(jvm.org.apache.hadoop.fs.Path(BRONZE_BASE)):
+    try:
+        target_df = (
+            spark.read.option("basePath", BRONZE_BASE).parquet(BRONZE_BASE)
+            .filter(
+                (F.col("invoice_date") >= F.lit(START_DATE).cast("date"))
+                & (F.col("invoice_date") <= F.lit(END_DATE).cast("date"))
+            )
+        )
+    except Exception:
+        target_df = bronze_df.limit(0)
+else:
+    target_df = bronze_df.limit(0)
 
 target_df.cache()
 
@@ -216,16 +235,16 @@ daily_check = (
 print()
 print("PER-DATE RECONCILIATION")
 
-daily_check.orderBy("batch_date").show(
-    1000,
-    truncate=False
-)
+# Một batch tối đa 100 ngày nên collect tối đa 100 dòng thống kê là an toàn.
+# Dùng cùng kết quả này để in log và kiểm tra, tránh chạy Spark action hai lần.
+daily_rows = daily_check.orderBy("batch_date").collect()
+for row in daily_rows:
+    print(
+        f"DATE={row['batch_date']} SOURCE={row['source_count']} "
+        f"TARGET={row['target_count']} DIFFERENCE={row['difference']}"
+    )
 
-failed_days = (
-    daily_check
-    .filter(F.col("difference") != 0)
-    .count()
-)
+failed_days = sum(1 for row in daily_rows if row["difference"] != 0)
 
 if failed_days != 0:
     raise RuntimeError(
@@ -239,25 +258,29 @@ print("PER-DATE STATUS = PASS")
 # TWO-WAY ROW HASH RECONCILIATION
 # ============================================================
 
-source_hashes = source_df.select(
-    F.col("_row_hash").alias("row_hash")
+source_hashes = source_df.groupBy(F.col("_row_hash").alias("row_hash")).count().withColumnRenamed(
+    "count", "source_count"
 )
-
-target_hashes = target_df.select(
-    F.col("_row_hash").alias("row_hash")
+target_hashes = target_df.groupBy(F.col("_row_hash").alias("row_hash")).count().withColumnRenamed(
+    "count", "target_count"
 )
-
-missing_in_bronze = (
-    source_hashes
-    .exceptAll(target_hashes)
-    .count()
+hash_metrics = (
+    source_hashes.join(target_hashes, ["row_hash"], "full")
+    .fillna(0, subset=["source_count", "target_count"])
+    .agg(
+        F.coalesce(
+            F.sum(F.greatest(F.col("source_count") - F.col("target_count"), F.lit(0))),
+            F.lit(0),
+        ).alias("missing_count"),
+        F.coalesce(
+            F.sum(F.greatest(F.col("target_count") - F.col("source_count"), F.lit(0))),
+            F.lit(0),
+        ).alias("extra_count"),
+    )
+    .collect()[0]
 )
-
-extra_in_bronze = (
-    target_hashes
-    .exceptAll(source_hashes)
-    .count()
-)
+missing_in_bronze = hash_metrics["missing_count"]
+extra_in_bronze = hash_metrics["extra_count"]
 
 print()
 print("TWO-WAY HASH RECONCILIATION")

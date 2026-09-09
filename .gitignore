@@ -18,11 +18,17 @@ dbt/**/.user.yml
 
 # Runtime datasets and generated lake files
 data/landing_csv/*.csv
-data/temp_parquet/
-data/bronze/
-data/silver/
-data/gold/
+data/temp_parquet/*
+!data/temp_parquet/.gitkeep
+data/bronze/*
+!data/bronze/.gitkeep
+data/silver/*
+!data/silver/.gitkeep
+data/gold/*
+!data/gold/.gitkeep
 data/quarantine/
+data/cdc/
+data/test_backups/
 
 # Local database backups and benchmark output
 *.dump

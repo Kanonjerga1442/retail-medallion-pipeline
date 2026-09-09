@@ -137,6 +137,10 @@ services:
       - /opt/spark/bin/spark-class
       - org.apache.spark.deploy.worker.Worker
       - spark://spark-master:7077
+      - --cores
+      - "4"
+      - --memory
+      - 2g
       - --webui-port
       - "8081"
 

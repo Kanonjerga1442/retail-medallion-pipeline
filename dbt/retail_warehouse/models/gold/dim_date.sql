@@ -2,6 +2,7 @@
     materialized='incremental',
     incremental_strategy='delete+insert',
     unique_key='date_key',
+    pre_hook="{{ delete_selected_range(this, 'full_date') }}",
     indexes=[
         {'columns': ['date_key'], 'unique': true},
         {'columns': ['full_date'], 'unique': true}

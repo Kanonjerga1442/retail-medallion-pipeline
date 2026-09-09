@@ -10,13 +10,14 @@ from pyspark.sql import functions as F
 # ARGUMENTS
 # ============================================================
 
-if len(sys.argv) != 3:
+if len(sys.argv) not in {3, 4}:
     raise ValueError(
-        "Usage: 02_bronze_to_temp_sql.py START_DATE END_DATE"
+        "Usage: 02_bronze_to_temp_sql.py START_DATE END_DATE [MODE]"
     )
 
 START_DATE = sys.argv[1]
 END_DATE = sys.argv[2]
+MODE = sys.argv[3] if len(sys.argv) == 4 else "backfill"
 
 start_dt = datetime.strptime(START_DATE, "%Y-%m-%d")
 end_dt = datetime.strptime(END_DATE, "%Y-%m-%d")
@@ -87,15 +88,25 @@ print("=" * 80)
 # READ SELECTED BRONZE PARTITIONS
 # ============================================================
 
-bronze_df = (
-    spark.read
-    .option("basePath", BRONZE_BASE)
-    .parquet(BRONZE_BASE)
-    .filter(
-        (F.col("invoice_date") >= F.lit(START_DATE).cast("date"))
-        &
-        (F.col("invoice_date") <= F.lit(END_DATE).cast("date"))
+try:
+    bronze_df = spark.read.option("basePath", BRONZE_BASE).parquet(BRONZE_BASE)
+except Exception:
+    run_token = os.getenv("CDC_RUN_TOKEN")
+    if not run_token:
+        raise
+    bronze_df = (
+        spark.read.parquet(
+            f"/opt/pipeline/data/cdc/active/{run_token}/candidate_snapshot"
+        )
+        .withColumn("_bronze_loaded_at", F.current_timestamp())
+        .withColumn("_process_date", F.col("_batch_date").cast("date"))
+        .withColumn("_pipeline_name", F.lit("online_retail"))
+        .withColumn("invoice_date", F.col("_batch_date").cast("date"))
     )
+
+bronze_df = bronze_df.filter(
+    (F.col("invoice_date") >= F.lit(START_DATE).cast("date"))
+    & (F.col("invoice_date") <= F.lit(END_DATE).cast("date"))
 )
 
 
@@ -190,11 +201,6 @@ stage_df.cache()
 
 source_count = stage_df.count()
 
-if source_count == 0:
-    raise RuntimeError(
-        f"No Bronze data between {START_DATE} and {END_DATE}"
-    )
-
 print(f"BRONZE RANGE COUNT = {source_count}")
 
 
@@ -243,19 +249,20 @@ finally:
 # INSERT SELECTED RANGE
 # ============================================================
 
-(
-    stage_df.write
-    .format("jdbc")
-    .option("url", JDBC_URL)
-    .option("dbtable", JDBC_TABLE)
-    .option("user", PGUSER)
-    .option("password", PGPASSWORD)
-    .option("driver", "org.postgresql.Driver")
-    .option("batchsize", "5000")
-    .option("numPartitions", "4")
-    .mode("append")
-    .save()
-)
+if source_count > 0:
+    (
+        stage_df.write
+        .format("jdbc")
+        .option("url", JDBC_URL)
+        .option("dbtable", JDBC_TABLE)
+        .option("user", PGUSER)
+        .option("password", PGPASSWORD)
+        .option("driver", "org.postgresql.Driver")
+        .option("batchsize", "5000")
+        .option("numPartitions", "4")
+        .mode("append")
+        .save()
+    )
 
 print("SPARK JDBC WRITE COMPLETE")
 

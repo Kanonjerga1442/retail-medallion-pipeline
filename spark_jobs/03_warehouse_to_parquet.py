@@ -1,19 +1,20 @@
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 
-if len(sys.argv) != 3:
+if len(sys.argv) not in {3, 4}:
     raise ValueError(
-        "Usage: 03_warehouse_to_parquet.py START_DATE END_DATE"
+        "Usage: 03_warehouse_to_parquet.py START_DATE END_DATE [MODE]"
     )
 
 
 START_DATE = sys.argv[1]
 END_DATE = sys.argv[2]
+MODE = sys.argv[3] if len(sys.argv) == 4 else "backfill"
 
 start_dt = datetime.strptime(START_DATE, "%Y-%m-%d")
 end_dt = datetime.strptime(END_DATE, "%Y-%m-%d")
@@ -79,6 +80,23 @@ def export_parquet(
     output_path,
     partition_column=None
 ):
+
+    jvm = spark.sparkContext._gateway.jvm
+    hadoop_conf = spark.sparkContext._jsc.hadoopConfiguration()
+    fs = jvm.org.apache.hadoop.fs.FileSystem.get(hadoop_conf)
+
+    if partition_column:
+        if MODE == "full_refresh":
+            fs.delete(jvm.org.apache.hadoop.fs.Path(output_path), True)
+        else:
+            cursor = start_dt
+            while cursor <= end_dt:
+                partition_path = (
+                    f"{output_path}/{partition_column}="
+                    f"{cursor.strftime('%Y-%m-%d')}"
+                )
+                fs.delete(jvm.org.apache.hadoop.fs.Path(partition_path), True)
+                cursor += timedelta(days=1)
 
     count = df.count()
 

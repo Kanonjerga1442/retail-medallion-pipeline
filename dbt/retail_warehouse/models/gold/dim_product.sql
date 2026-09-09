@@ -2,6 +2,7 @@
     materialized='incremental',
     incremental_strategy='delete+insert',
     unique_key='product_key',
+    pre_hook="{{ delete_orphan_dimension(this, 'stock_code', ref('retail_transactions'), 'stock_code') }}",
     indexes=[
         {'columns': ['product_key'], 'unique': true},
         {'columns': ['stock_code'], 'unique': true}
@@ -18,8 +19,6 @@ WITH ranked_products AS (
             ORDER BY invoice_timestamp DESC, silver_loaded_at DESC, row_hash DESC
         ) AS row_number
     FROM {{ ref('retail_transactions') }}
-    WHERE batch_date BETWEEN '{{ var("start_date") }}'::date
-                         AND '{{ var("end_date") }}'::date
 )
 
 SELECT
